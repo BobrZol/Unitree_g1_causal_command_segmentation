@@ -13,7 +13,7 @@ class BvhDataset:
         self.dataset = []
         self.list_names = list_names
         for num in list_names:
-            self.dataset.append(bvhio.readAsHierarchy(f'dataset/rec_{num}_chr01_MAYA.bvh'))
+            self.dataset.append(bvhio.readAsHierarchy(f'dataset/dataset_my/rec_{num}_chr01_MAYA.bvh'))
 
         # начинаем разметку и построения датасетов
         self.__build_movement_speed()
