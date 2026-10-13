@@ -8,21 +8,20 @@ from IPython.display import display
 from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import KMeans
 from sklearn.metrics import confusion_matrix
-from constants import (RANDOM_STATE, WINDOW_STEP_SECONDS, N_ACTION_PROTOTYPES, N_SUBACTION_PROTOTYPES, NEUTRAL_ID, ACTIVE_COMMAND_IDS, COMMANDS, MAJORITY_WINDOWS, CONFIRMATION_WINDOWS, CONFIDENCE_THRESHOLDS, EVENT_IOU_THRESHOLD)
+from constants import (RANDOM_STATE, WINDOW_STEP_SECONDS, N_ACTION_PROTOTYPES, N_SUBACTION_PROTOTYPES, NEUTRAL_ID, ACTIVE_COMMAND_IDS, COMMANDS, MAJORITY_WINDOWS, CONFIRMATION_WINDOWS, CONFIDENCE_THRESHOLDS, EVENT_IOU_THRESHOLD, EVENT_IOU_THRESHOLDS)
 from matplotlib.patches import Patch
 import argparse
-from dataset import BvhDataset
 
 
-DATA_DIR, RESULTS_DIR = Path('dataset'), Path('results')
-FIG_DIR = RESULTS_DIR / 'figures'; FIG_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR, RESULTS_DIR = Path('dataset/dataset_my'), Path('results_my')
+FIG_DIR = RESULTS_DIR / 'figures'
 LABEL_NAMES = {0: 'DISTRACTOR', 1: 'NEUTRAL', 2: 'FORWARD', 3: 'LEFT', 4: 'RIGHT'}
 ALL_LABELS = np.array(sorted(LABEL_NAMES))
 
 np.set_printoptions(precision=3, suppress=True); sns.set_theme(style='whitegrid', context='notebook')
 
-def load_split(name):
-    df = pd.read_csv(DATA_DIR / f'{name}.csv')
+def load_split(name, data_dir=DATA_DIR):
+    df = pd.read_csv(Path(data_dir) / f'{name}.csv')
     meta_columns = ['record_id', 'window_start_frame', 'window_end_frame']
     pc_columns = [c for c in df.columns if c.startswith('pc')]
 
@@ -39,14 +38,15 @@ def record_slices(record_ids, meta):
     return slices, [sl.stop - sl.start for sl in slices]
 
 # Обучение VQ и сопоставление прототипов
-def fit_cluster_mapping(cluster_ids, labels, n_clusters):
-    score = np.zeros((n_clusters, len(COMMANDS)), dtype=int)
+def fit_cluster_mapping(cluster_ids, labels, n_clusters, *, commands=COMMANDS):
+    """Сопоставление с переданными классами; по умолчанию — команды G1."""
+    score = np.zeros((n_clusters, len(commands)), dtype=int)
     for k in range(n_clusters):
-        for j, c in enumerate(COMMANDS):
+        for j, c in enumerate(commands):
             score[k, j] = np.sum((cluster_ids == k) & (labels == c))
 
     rows, cols = linear_sum_assignment(-score)
-    mapping = {int(k): int(COMMANDS[j]) for k, j in zip(rows, cols)}
+    mapping = {int(k): int(commands[j]) for k, j in zip(rows, cols)}
 
     if len(mapping) != n_clusters or any(score[k].sum() == 0 for k in mapping):
         raise RuntimeError('Не удалось однозначно сопоставить VQ-прототипы')
@@ -55,9 +55,10 @@ def fit_cluster_mapping(cluster_ids, labels, n_clusters):
 def predict_one_level(X, one_mapping, one_vq):
     return np.array([one_mapping[int(k)] for k in one_vq.predict(X)], dtype=int)
 
-def predict_two_level(X, sub_vq, z_to_a, two_mapping, with_confidence=False):
+def predict_two_level(X, sub_vq, z_to_a, two_mapping, with_confidence=False,
+                      *, n_action_prototypes=N_ACTION_PROTOTYPES):
     dz = sub_vq.transform(X)
-    da = np.column_stack([dz[:, z_to_a == a].min(axis=1) for a in range(N_ACTION_PROTOTYPES)])
+    da = np.column_stack([dz[:, z_to_a == a].min(axis=1) for a in range(n_action_prototypes)])
     order = np.argsort(da, axis=1)
     best = order[:, 0]
 
@@ -68,7 +69,8 @@ def predict_two_level(X, sub_vq, z_to_a, two_mapping, with_confidence=False):
     return (pred, confidence) if with_confidence else pred
 
 # Каузальные фильтры и метрики
-# Event-F1 использует однозначное сопоставление сегментов классов с IoU >= 0.50.
+# Event-F1 показывается для IoU >= 0.10, 0.25 и 0.50. Остальные event-метрики
+# используют основной строгий порог IoU >= 0.50.
 # Ложная активация - непарное предсказанное активное событие, двойная команда - каждый повторный старт той же команды внутри одного эталонного активного сегмента.
 # Задержка измеряется для найденных событий. Кроме того двойственность возможна в понятии двойных команд мы учитываем просто bool мол состоялась ли двойная команда
 # в интервале, или количество колибаний, я посчитал количество кажется это логичнее. 
@@ -88,7 +90,8 @@ def causal_majority(labels, window):
         out[t] = v[np.argmax(n)]
     return out
 
-def transition_automaton(labels, confidence, confirmations, threshold):
+def transition_automaton(labels, confidence, confirmations, threshold,
+                         *, neutral_id=NEUTRAL_ID, label_names=LABEL_NAMES):
     """
         Каузальный автомат переходов NEUTRAL -> TRANSITION -> ACTIVE(command).
         Новая команда активируется только после confirmations подряд идущих
@@ -104,7 +107,7 @@ def transition_automaton(labels, confidence, confirmations, threshold):
             out - подтверждённые команды (N,)
             states - состояния автомата (N,): 'NEUTRAL', 'TRANSITION', 'ACTIVE_<name>'
     """
-    current, pending, run = NEUTRAL_ID, None, 0
+    current, pending, run = neutral_id, None, 0
     out, states = np.empty_like(labels), []
 
     for observed, conf in zip(labels, confidence):
@@ -112,14 +115,14 @@ def transition_automaton(labels, confidence, confirmations, threshold):
 
         if proposed == current: # ничерта не поменялось новых кандидатов нет
             pending, run = None, 0
-            state = 'NEUTRAL' if current == NEUTRAL_ID else f'ACTIVE_{LABEL_NAMES[current]}'
+            state = 'NEUTRAL' if current == neutral_id else f'ACTIVE_{label_names[current]}'
         else: # появился новый кандидат на смену current
             run = run + 1 if pending == proposed else 1
             pending = proposed
 
             if run >= confirmations: # опа меняем
                 current, pending, run = proposed, None, 0
-                state = 'NEUTRAL' if current == NEUTRAL_ID else f'ACTIVE_{LABEL_NAMES[current]}'
+                state = 'NEUTRAL' if current == neutral_id else f'ACTIVE_{label_names[current]}'
             else: # начинаем преход
                 state = 'TRANSITION'
 
@@ -156,7 +159,7 @@ def apply_per_record(labels, slices, fn, confidence=None):
 
     return out, states
 
-def events(labels):
+def events(labels, *, active_command_ids=ACTIVE_COMMAND_IDS):
     """
         Находит непрерывные отрезки активных команд в последовательности меток.
 
@@ -179,13 +182,13 @@ def events(labels):
 
     for t in range(1, len(labels) + 1):
         if t == len(labels) or labels[t] != labels[start]:
-            if labels[start] in ACTIVE_COMMAND_IDS:
+            if labels[start] in active_command_ids:
                 answer.append((int(labels[start]), start, t))
             start = t
 
     return answer
 
-def event_matches(reference, predicted):
+def event_matches(reference, predicted, *, iou_threshold=EVENT_IOU_THRESHOLD):
     """
         Сопоставляет предсказанные события с эталонными по IoU-перекрытию.
 
@@ -213,7 +216,7 @@ def event_matches(reference, predicted):
             inter = max(0, min(pe, re)-max(ps, rs))
             union = max(pe, re)-min(ps, rs)
 
-            if lab == rlab and inter / union >= EVENT_IOU_THRESHOLD:
+            if lab == rlab and inter / union >= iou_threshold:
                 candidates.append((inter / union, ri))
 
         if candidates:
@@ -221,7 +224,14 @@ def event_matches(reference, predicted):
 
     return matches
 
-def evaluate(y_true, y_pred, slices):
+def event_f1_column(iou_threshold):
+    """Имя колонки для Event-F1 при заданном IoU-пороге."""
+    return f'event_f1@{round(100 * iou_threshold):02d}'
+
+
+def evaluate(y_true, y_pred, slices, *, active_command_ids=ACTIVE_COMMAND_IDS,
+             window_step_seconds=WINDOW_STEP_SECONDS, iou_threshold=EVENT_IOU_THRESHOLD,
+             f1_iou_thresholds=EVENT_IOU_THRESHOLDS):
     """
         Считает все метрики задания на наборе записей.
 
@@ -232,8 +242,10 @@ def evaluate(y_true, y_pred, slices):
         Выход:
             dict с метриками:
                 frame_accuracy - покадровая точность (п.10.1)
+                event_f1@10, event_f1@25, event_f1@50 - F1 по событиям
+                    при соответствующих IoU-порогах (п.10.2)
                 event_precision, event_recall - точность/полнота по событиям
-                event_f1 - F1 по событиям (п.10.2)
+                    при основном пороге iou_threshold
                 false_activations_per_min - ложные активации в минуту (п.10.3)
                 median_delay_s - медианная задержка (п.10.4)
                 p95_delay_s - 95-й перцентиль задержки (п.10.5)
@@ -242,10 +254,17 @@ def evaluate(y_true, y_pred, slices):
                 reference_events, predicted_events - вспомогательные счётчики
     """
     refs, preds, matches, offset = [], [], [], 0
+    f1_iou_thresholds = tuple(dict.fromkeys(float(x) for x in f1_iou_thresholds))
+    matches_by_iou = {threshold: [] for threshold in f1_iou_thresholds}
 
     for sl in slices:
-        ref, pred = events(y_true[sl]), events(y_pred[sl])
-        local = event_matches(ref, pred)
+        ref = events(y_true[sl], active_command_ids=active_command_ids)
+        pred = events(y_pred[sl], active_command_ids=active_command_ids)
+        local = event_matches(ref, pred, iou_threshold=iou_threshold)
+        local_by_iou = {
+            threshold: event_matches(ref, pred, iou_threshold=threshold)
+            for threshold in f1_iou_thresholds
+        }
 
         ref_base, pred_base = len(refs), len(preds)
 
@@ -253,6 +272,10 @@ def evaluate(y_true, y_pred, slices):
         refs.extend([(a, s + offset, e + offset) for a, s, e in ref])
         preds.extend([(a, s + offset, e + offset) for a, s, e in pred])
         matches.extend([(ri + ref_base, pi + pred_base) for ri, pi in local])
+        for threshold, local_matches in local_by_iou.items():
+            matches_by_iou[threshold].extend(
+                (ri + ref_base, pi + pred_base) for ri, pi in local_matches
+            )
 
         offset += sl.stop - sl.start
 
@@ -261,19 +284,27 @@ def evaluate(y_true, y_pred, slices):
     recall = tp / nr if nr else 0
 
 
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0
-    delays = [max(0, preds[pi][1] - refs[ri][1]) * WINDOW_STEP_SECONDS for ri, pi in matches]
+    event_f1s = {}
+    for threshold, threshold_matches in matches_by_iou.items():
+        threshold_precision = len(threshold_matches) / npred if npred else 0
+        threshold_recall = len(threshold_matches) / nr if nr else 0
+        event_f1s[event_f1_column(threshold)] = (
+            2 * threshold_precision * threshold_recall / (threshold_precision + threshold_recall)
+            if threshold_precision + threshold_recall else 0
+        )
+    delays = [max(0, preds[pi][1] - refs[ri][1]) * window_step_seconds for ri, pi in matches]
     doubles = sum(max(0, sum(a == ra and rs <= ps < re for a, ps, _ in preds) - 1) for ra, rs, re in refs)
-    duration_min = len(y_true) * WINDOW_STEP_SECONDS / 60
+    duration_min = len(y_true) * window_step_seconds / 60
 
-    return {'frame_accuracy': np.mean(y_true == y_pred), 'event_precision': precision, 'event_recall': recall, 'event_f1': f1,
+    return {'frame_accuracy': np.mean(y_true == y_pred), **event_f1s,
+            'event_precision': precision, 'event_recall': recall,
             'false_activations_per_min': (npred - tp) / duration_min, 'median_delay_s': np.median(delays) if delays else np.nan,
             'p95_delay_s': np.percentile(delays, 95) if delays else np.nan, 'double_commands_per_transition': doubles / nr if nr else np.nan,
             'missed_commands': nr - tp, 'reference_events': nr, 'predicted_events': npred}
 
 # постройка графиков
 
-def build_plot_reliability_latency_m4(tuning):
+def build_plot_reliability_latency_m4(tuning, *, fig_dir=FIG_DIR):
     tradeoff = tuning.query("method == 'M4_two_level_automaton'").copy()
 
     fig, ax = plt.subplots(figsize=(14, 7))
@@ -363,14 +394,18 @@ def build_plot_reliability_latency_m4(tuning):
             loc='upper right', framealpha=0.95)
 
     fig.tight_layout()
-    fig.savefig(FIG_DIR / 'validation_reliability_delay.png',
-                dpi=160, bbox_inches='tight')
+    if fig_dir is not None:
+        Path(fig_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(fig_dir) / 'validation_reliability_delay.png',
+                    dpi=160, bbox_inches='tight')
+    return fig
 
-def build_plot_prediction_reference(predictions, y_test):
+def build_plot_prediction_reference(predictions, y_test, *, labels=ALL_LABELS,
+                                     label_names=LABEL_NAMES, fig_dir=FIG_DIR):
     fig, axes = plt.subplots(2, 2, figsize=(13, 13), constrained_layout=True)
 
     for ax, (name, pred) in zip(axes.flat, predictions.items()):
-        cm = confusion_matrix(y_test, pred, labels=ALL_LABELS)
+        cm = confusion_matrix(y_test, pred, labels=labels)
 
         sns.heatmap(
             cm,
@@ -379,8 +414,8 @@ def build_plot_prediction_reference(predictions, y_test):
             cmap='Blues',
             cbar=False,
             ax=ax,
-            xticklabels=[LABEL_NAMES[i] for i in ALL_LABELS],
-            yticklabels=[LABEL_NAMES[i] for i in ALL_LABELS],
+            xticklabels=[label_names[i] for i in labels],
+            yticklabels=[label_names[i] for i in labels],
         )
 
         ax.set_title(name, fontweight='bold')
@@ -390,9 +425,12 @@ def build_plot_prediction_reference(predictions, y_test):
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontweight('bold')
 
-    fig.savefig(FIG_DIR / 'test_confusion_matrices.png', dpi=160)
+    if fig_dir is not None:
+        Path(fig_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(fig_dir) / 'test_confusion_matrices.png', dpi=160)
+    return fig
 
-def build_plot_reliability_latency_compare(comparison):
+def build_plot_reliability_latency_compare(comparison, *, fig_dir=FIG_DIR):
     fig, ax = plt.subplots(figsize=(6, 5))
 
     for _, row in comparison.iterrows():
@@ -418,16 +456,22 @@ def build_plot_reliability_latency_compare(comparison):
     ax.set_title('test: надёжность–задержка', fontweight='bold')
 
     fig.tight_layout()
-    fig.savefig(FIG_DIR / 'test_reliability_delay.png', dpi=160)
+    if fig_dir is not None:
+        Path(fig_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(fig_dir) / 'test_reliability_delay.png', dpi=160)
+    return fig
 
 
 # Offline-демонстратор и автоматический тест каузальности
 
-def assert_causal(labels, confidence, confirmations, threshold):
-    full, _ = transition_automaton(labels, confidence, confirmations, threshold)
+def assert_causal(labels, confidence, confirmations, threshold,
+                  *, neutral_id=NEUTRAL_ID, label_names=LABEL_NAMES):
+    full, _ = transition_automaton(labels, confidence, confirmations, threshold,
+                                  neutral_id=neutral_id, label_names=label_names)
     for end in range(1, len(labels) + 1):
         prefix, _ = transition_automaton(labels[:end], confidence[:end],
-                                         confirmations, threshold)
+                                         confirmations, threshold,
+                                         neutral_id=neutral_id, label_names=label_names)
         if not np.array_equal(prefix, full[:end]):
             raise AssertionError(f'Нарушение каузальности в окне {end}')
     return True
@@ -515,10 +559,13 @@ def offline_demonstrator_and_automated_causality_test(test_slices, num_slices, t
     fig.suptitle(f'Offline-демонстратор',
                 fontweight='bold', y=1.02, fontsize=30)
 
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
     fig.savefig(FIG_DIR / f'offline_demo_rec_{test_record_ids[num_slices]}.png',
                 dpi=160, bbox_inches='tight')
 
 def main():
+    from dataset import BvhDataset
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--records",
@@ -575,7 +622,8 @@ def main():
     print('Двухуровневое сопоставление:', two_mapping, '; z->a:', z_to_a.tolist())
     print('Размеры поддействий:', sub_weights.astype(int).tolist())
 
-    # Настройка только на conf. Будем выбирать так: максимальный Event-F1, затем минимум ложных активаций/мин, затем минимум 95%-й задержки.
+    # Настройка только на conf. Выбираем по строгому Event-F1@50, затем по
+    # минимуму ложных активаций/мин и 95%-й задержки.
     # Соритируем по "лексеграфическому" порядку
 
     one_conf = predict_one_level(X_conf, one_mapping, one_vq)
@@ -593,12 +641,12 @@ def main():
     tuning = pd.DataFrame(rows)
 
     def choose(df):
-        return df.sort_values(['event_f1', 'false_activations_per_min', 'p95_delay_s', 'median_delay_s'], ascending=[False, True, True, True], na_position='last').iloc[0]
+        return df.sort_values(['event_f1@50', 'false_activations_per_min', 'p95_delay_s', 'median_delay_s'], ascending=[False, True, True, True], na_position='last').iloc[0]
 
     best_m2, best_m4 = choose(tuning.query("method == 'M2_one_level_majority'")), choose(tuning.query("method == 'M4_two_level_automaton'"))
     best_window = int(best_m2.window); best_confirmations, best_threshold = int(best_m4.confirmations), float(best_m4.threshold)
     tuning.to_csv(RESULTS_DIR / 'validation_tuning.csv', index=False)
-    display(tuning.sort_values(['method','event_f1'], ascending=[True,False]))
+    display(tuning.sort_values(['method','event_f1@50'], ascending=[True,False]))
 
     print(f'Зафиксированы параметры: M2 window={best_window}; M4 confirmations={best_confirmations}, threshold={best_threshold:.2f}')
 
