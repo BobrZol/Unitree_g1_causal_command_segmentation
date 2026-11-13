@@ -8,17 +8,53 @@ from IPython.display import display
 from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import KMeans
 from sklearn.metrics import confusion_matrix
-from constants import (RANDOM_STATE, WINDOW_STEP_SECONDS, N_ACTION_PROTOTYPES, N_SUBACTION_PROTOTYPES, NEUTRAL_ID, ACTIVE_COMMAND_IDS, COMMANDS, MAJORITY_WINDOWS, CONFIRMATION_WINDOWS, CONFIDENCE_THRESHOLDS, EVENT_IOU_THRESHOLD, EVENT_IOU_THRESHOLDS)
+from constants import (RANDOM_STATE, WINDOW_STEP_SECONDS, N_ACTION_PROTOTYPES, N_SUBACTION_PROTOTYPES, DISTRACTOR_ID, NEUTRAL_ID, ACTIVE_COMMAND_IDS, COMMANDS, MAJORITY_WINDOWS, CONFIRMATION_WINDOWS, CONFIDENCE_THRESHOLDS, EVENT_IOU_THRESHOLD, EVENT_IOU_THRESHOLDS)
 from matplotlib.patches import Patch
 import argparse
+from constants import SPLIT_DATA_DIR, RESULTS_DIR, RECORD_IDS, M4_F1_TOLERANCE, M4_SELECTION_MODE
 
 
-DATA_DIR, RESULTS_DIR = Path('dataset/dataset_my'), Path('results_my')
+DATA_DIR = SPLIT_DATA_DIR
 FIG_DIR = RESULTS_DIR / 'figures'
 LABEL_NAMES = {0: 'DISTRACTOR', 1: 'NEUTRAL', 2: 'FORWARD', 3: 'LEFT', 4: 'RIGHT'}
 ALL_LABELS = np.array(sorted(LABEL_NAMES))
 
 np.set_printoptions(precision=3, suppress=True); sns.set_theme(style='whitegrid', context='notebook')
+
+def choose_m4_params(table, *, baseline_f1, f1_tolerance=M4_F1_TOLERANCE,
+                     mode=M4_SELECTION_MODE):
+    """Два правила подбора M4 на conf: f1 и reliability."""
+    if mode not in ("f1", "reliability"):
+        raise ValueError("Режим подбора должен быть f1 или reliability.")
+    if not np.isfinite(baseline_f1) or not 0 <= baseline_f1 <= 1:
+        raise ValueError("Нужен лучший F1 среди M1–M3 на conf от 0 до 1.")
+    if not np.isfinite(f1_tolerance) or not 0 <= f1_tolerance <= 1:
+        raise ValueError("Относительный допуск F1 должен быть от 0 до 1.")
+    valid = table.loc[np.isfinite(table["event_f1@50"])]
+    if valid.empty:
+        raise ValueError("Нет вариантов M4 с конечным Event-F1@50 на conf.")
+    best_f1 = valid["event_f1@50"].max()
+    if mode == "f1":
+        cutoff = best_f1
+        selected = valid.sort_values(
+            ["event_f1@50", "false_activations_per_min", "p95_delay_s", "median_delay_s"],
+            ascending=[False, True, True, True], kind="stable", na_position="last",
+        ).iloc[0].copy()
+    else:
+        cutoff = baseline_f1 if best_f1 >= baseline_f1 else best_f1 * (1 - f1_tolerance)
+        eligible = valid.loc[valid["event_f1@50"] >= cutoff - 1e-12]
+        selected = eligible.sort_values(
+            ["false_activations_per_min", "double_commands_per_transition",
+             "p95_delay_s", "median_delay_s", "event_f1@50"],
+            ascending=[True, True, True, True, False],
+            kind="stable", na_position="last",
+        ).iloc[0].copy()
+    selected["selection_mode"] = mode
+    selected["conf_baseline_f1@50"] = baseline_f1
+    selected["conf_best_m4_f1@50"] = best_f1
+    selected["conf_min_m4_f1@50"] = cutoff
+    return selected
+
 
 def load_split(name, data_dir=DATA_DIR):
     df = pd.read_csv(Path(data_dir) / f'{name}.csv')
@@ -29,6 +65,8 @@ def load_split(name, data_dir=DATA_DIR):
 
 def record_slices(record_ids, meta):
     ids = meta['record_id'].to_numpy()
+    if len(ids) == 0:
+        raise ValueError('Выборка не содержит окон')
     starts = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1]
     stops = np.r_[starts[1:], len(ids)]
     actual_ids = tuple(ids[starts])
@@ -91,9 +129,10 @@ def causal_majority(labels, window):
     return out
 
 def transition_automaton(labels, confidence, confirmations, threshold,
-                         *, neutral_id=NEUTRAL_ID, label_names=LABEL_NAMES):
+                         *, neutral_id=NEUTRAL_ID, label_names=LABEL_NAMES,
+                         distractor_id=DISTRACTOR_ID):
     """
-        Каузальный автомат переходов NEUTRAL -> TRANSITION -> ACTIVE(command).
+        Каузальный автомат с отдельными состояниями NEUTRAL и DISTRACTOR.
         Новая команда активируется только после confirmations подряд идущих
         одинаковых решений с уверенностью не ниже threshold.
 
@@ -101,28 +140,33 @@ def transition_automaton(labels, confidence, confirmations, threshold,
             labels - метки классов от квантования (N,)
             confidence - уверенность на каждом окне [0, 1] (N,)
             confirmations - число подтверждений подряд (1, 3, 5)
-            threshold - порог уверенности, ниже которого окно игнорируется
+            threshold - ниже порога удерживаем последнюю подтверждённую команду
+            distractor_id - начальная метка, None задаёт начальный NEUTRAL
 
         Выход:
-            out - подтверждённые команды (N,)
-            states - состояния автомата (N,): 'NEUTRAL', 'TRANSITION', 'ACTIVE_<name>'
+            out - последняя подтверждённая команда (N,)
+            states - состояния автомата (N,): 'DISTRACTOR', 'NEUTRAL', 'TRANSITION', 'ACTIVE_<name>'
     """
-    current, pending, run = neutral_id, None, 0
-    out, states = np.empty_like(labels), []
+    current = neutral_id if distractor_id is None else distractor_id
+    pending, run = None, 0
+    out, states = np.empty(len(labels), dtype=np.int64), []
 
     for observed, conf in zip(labels, confidence):
+        # Неуверенное окно не меняет команду и прерывает серию подтверждений.
         proposed = int(observed) if conf >= threshold else current
 
         if proposed == current: # ничерта не поменялось новых кандидатов нет
             pending, run = None, 0
-            state = 'NEUTRAL' if current == neutral_id else f'ACTIVE_{label_names[current]}'
+            state = ('DISTRACTOR' if current == distractor_id else
+                     'NEUTRAL' if current == neutral_id else f'ACTIVE_{label_names[current]}')
         else: # появился новый кандидат на смену current
             run = run + 1 if pending == proposed else 1
             pending = proposed
 
             if run >= confirmations: # опа меняем
                 current, pending, run = proposed, None, 0
-                state = 'NEUTRAL' if current == neutral_id else f'ACTIVE_{label_names[current]}'
+                state = ('DISTRACTOR' if current == distractor_id else
+                         'NEUTRAL' if current == neutral_id else f'ACTIVE_{label_names[current]}')
             else: # начинаем преход
                 state = 'TRANSITION'
 
@@ -147,7 +191,7 @@ def apply_per_record(labels, slices, fn, confidence=None):
             states - состояния (N,). Если fn вернул кортеж (out, states) —
                     берём состояния оттуда. Иначе заполняем 'FILTERED'.
     """
-    out, states = np.empty_like(labels), np.empty(len(labels), dtype=object)
+    out, states = np.empty(len(labels), dtype=np.int64), np.empty(len(labels), dtype=object)
 
     for sl in slices:
         answer = fn(labels[sl]) if confidence is None else fn(labels[sl], confidence[sl])
@@ -234,6 +278,7 @@ def evaluate(y_true, y_pred, slices, *, active_command_ids=ACTIVE_COMMAND_IDS,
              f1_iou_thresholds=EVENT_IOU_THRESHOLDS):
     """
         Считает все метрики задания на наборе записей.
+        Оцениваем выходные метки команд, а не внутренние состояния автомата.
 
         Вход:
             y_true - эталонные метки (N,)
@@ -309,8 +354,8 @@ def build_plot_reliability_latency_m4(tuning, *, fig_dir=FIG_DIR):
 
     fig, ax = plt.subplots(figsize=(14, 7))
 
-    colors = {1: 'tab:blue', 3: 'tab:orange', 5: 'tab:green'}
-    markers = {1: 'o', 3: 's', 5: '^'}
+    colors = {1: 'tab:blue', 2: 'tab:purple', 3: 'tab:orange', 4: 'tab:red', 5: 'tab:green'}
+    markers = {1: 'o', 2: 'D', 3: 's', 4: 'v', 5: '^'}
     EPS = 0.01
     ROUND = 3
 
@@ -465,120 +510,140 @@ def build_plot_reliability_latency_compare(comparison, *, fig_dir=FIG_DIR):
 # Offline-демонстратор и автоматический тест каузальности
 
 def assert_causal(labels, confidence, confirmations, threshold,
-                  *, neutral_id=NEUTRAL_ID, label_names=LABEL_NAMES):
+                  *, neutral_id=NEUTRAL_ID, label_names=LABEL_NAMES,
+                  distractor_id=DISTRACTOR_ID):
     full, _ = transition_automaton(labels, confidence, confirmations, threshold,
-                                  neutral_id=neutral_id, label_names=label_names)
+                                  neutral_id=neutral_id, label_names=label_names,
+                                  distractor_id=distractor_id)
     for end in range(1, len(labels) + 1):
         prefix, _ = transition_automaton(labels[:end], confidence[:end],
                                          confirmations, threshold,
-                                         neutral_id=neutral_id, label_names=label_names)
+                                         neutral_id=neutral_id, label_names=label_names,
+                                         distractor_id=distractor_id)
         if not np.array_equal(prefix, full[:end]):
             raise AssertionError(f'Нарушение каузальности в окне {end}')
     return True
 
-def offline_demonstrator_and_automated_causality_test(test_slices, num_slices, test_record_ids, two_test, two_test_confidence, best_confirmations, best_threshold, y_test, m4_test, m4_states):
+def cumulative_switches(values):
+    # Только смены выходных команд. Внутренние состояния сюда не передаются.
+    return np.cumsum(np.r_[False, np.asarray(values)[1:] != np.asarray(values)[:-1]]) if len(values) else np.array([], dtype=int)
+
+
+def offline_demonstrator_and_automated_causality_test(
+        test_slices, num_slices, test_record_ids, two_test, two_test_confidence,
+        best_confirmations, best_threshold, y_test, m4_test, m4_states,
+        *, zoom_seconds=40.0, zoom_interval=(30, 80), fig_dir=FIG_DIR):
+    """Общая запись слева и увеличенный фрагмент M3/M4 справа."""
     demo_slice = test_slices[num_slices]
-    assert_causal(two_test[demo_slice], two_test_confidence[demo_slice],
-                best_confirmations, best_threshold)
+    reference = np.asarray(y_test[demo_slice])
+    raw = np.asarray(two_test[demo_slice])
+    stable = np.asarray(m4_test[demo_slice])
+    if not len(reference):
+        raise ValueError("Для демонстратора нужна непустая запись.")
+    assert_causal(raw, two_test_confidence[demo_slice], best_confirmations, best_threshold)
+    dt = WINDOW_STEP_SECONDS
+    t = np.arange(len(reference)) * dt
+    duration = len(reference) * dt
 
-    t = np.arange(demo_slice.stop - demo_slice.start) * WINDOW_STEP_SECONDS
-    reference = y_test[demo_slice]
-    raw = two_test[demo_slice]
-    stable = m4_test[demo_slice]
-    states = m4_states[demo_slice]
+    if zoom_interval is None:
+        if not np.isfinite(zoom_seconds) or zoom_seconds <= 0:
+            raise ValueError("Длительность увеличенного фрагмента должна быть положительной.")
+        width = min(len(reference), max(1, int(round(zoom_seconds / dt))))
+        gain = (stable == reference).astype(int) - (raw == reference).astype(int)
+        prefix = np.r_[0, np.cumsum(gain)]
+        scores = prefix[width:] - prefix[:-width]
+        left = int(np.argmax(scores))
+        right = left + width
+    else:
+        lo, hi = zoom_interval
+        if not 0 <= lo < hi <= duration:
+            raise ValueError("Границы увеличенного фрагмента должны лежать внутри записи.")
+        left = int(np.floor(lo / dt))
+        right = min(len(reference), int(np.ceil(hi / dt)))
+    lo, hi = left * dt, right * dt
 
-    state_code = np.array([5 if s == 'TRANSITION' else p
-                        for s, p in zip(states, stable)])
+    colors = {0: '#9e9e9e', 1: '#e0e0e0', 2: '#1f77b4', 3: '#2ca02c', 4: '#d62728'}
+    titles = ['Эталонная команда', 'Выходные команды M3', 'Выходная команда M4']
+    tracks = [reference, raw, stable]
 
-    COLORS = {
-        0: '#9e9e9e',   # DISTRACTOR — серый
-        1: '#e0e0e0',   # NEUTRAL — светло-серый
-        2: '#1f77b4',   # FORWARD — синий
-        3: '#2ca02c',   # LEFT — зелёный
-        4: '#d62728',   # RIGHT — красный
-        5: '#ff7f0e',   # TRANSITION — оранжевый
-    }
-    LABELS = {0: 'DISTRACTOR', 1: 'NEUTRAL', 2: 'FORWARD',
-            3: 'LEFT', 4: 'RIGHT', 5: 'TRANSITION'}
-
-    def draw_track(ax, values, y_offset=0.15, height=0.7):
-        """Цветные полосы: одна на каждое непрерывное событие."""
-        t0, i = 0, 0
-        while i < len(values):
-            start, cmd = i, int(values[i])
-            while i < len(values) and int(values[i]) == cmd:
-                i += 1
-            ax.fill_between([start * WINDOW_STEP_SECONDS, i * WINDOW_STEP_SECONDS],
-                            y_offset, y_offset + height,
-                            color=COLORS[cmd], edgecolor='white', linewidth=0.6)
-
-    fig, axes = plt.subplots(4, 1, figsize=(17, 14), sharex=True,
-                            constrained_layout=True,
-                            gridspec_kw={'height_ratios': [1, 1, 1, 1.2]})
-
-    titles = ['Эталонная команда',
-            'Исходная метка (двухуровневый VQ)',
-            'Состояние после каузального автомата',
-            'Накопленное число переключений']
-    tracks = [reference, raw, state_code]
-
-    for ax, values, title in zip(axes[:3], tracks, titles):
-        draw_track(ax, values, y_offset=0.15, height=0.7)
+    def draw_track(ax, values, begin, end):
+        index = begin
+        while index < end:
+            first, label = index, int(values[index])
+            while index < end and int(values[index]) == label:
+                index += 1
+            ax.broken_barh([(first * dt, (index - first) * dt)], (0.15, 0.7),
+                          facecolors=colors[label], edgecolors='white', linewidth=0.5)
         ax.set_ylim(0, 1)
         ax.set_yticks([])
-        ax.set_title(title, fontweight='bold', loc='left', fontsize=24)
-        ax.grid(axis='x', alpha=0.3)
+        ax.grid(axis='x', alpha=0.25)
+        ax.tick_params(labelsize=15)
 
-    legend_handles = [Patch(facecolor=COLORS[k], edgecolor='white',
-                            label=LABELS[k]) for k in [1, 2, 3, 4, 5, 0]]
-    axes[0].legend(handles=legend_handles, loc='upper right',
-                ncol=6, fontsize=12, framealpha=0.9)
+    fig = plt.figure(figsize=(30, 13))
+    grid = fig.add_gridspec(4, 2, width_ratios=[1.8, 1], height_ratios=[1, 1, 1, 1.5],
+                           left=0.055, right=0.98, bottom=0.08, top=0.86,
+                           hspace=0.65, wspace=0.22)
+    axes = [fig.add_subplot(grid[i, 0]) for i in range(4)]
+    zoom_axes = [fig.add_subplot(grid[i, 1]) for i in range(3)]
+    for ax, zoom_ax, values, title in zip(axes, zoom_axes, tracks, titles):
+        draw_track(ax, values, 0, len(values))
+        draw_track(zoom_ax, values, left, right)
+        ax.set_xlim(0, duration)
+        zoom_ax.set_xlim(lo, hi)
+        ax.set_title(title, loc='left', fontsize=23, fontweight='bold')
+        zoom_ax.set_title(title, loc='left', fontsize=20, fontweight='bold')
+        ax.axvspan(lo, hi, facecolor='none', edgecolor='black', linewidth=2, linestyle='--')
+    zoom_axes[-1].set_xlabel('Время от начала записи, с', fontsize=21, fontweight='bold')
 
-    def cumulative_switches(values):
-        changes = values[1:] != values[:-1]
-        return np.r_[0, np.cumsum(changes)]
-
-    axes[3].step(t, cumulative_switches(raw), where='post',
-                linewidth=1.5, color='#888888', label='raw VQ')
-    axes[3].step(t, cumulative_switches(stable), where='post',
-                linewidth=2.0, color='#d62728', label='automaton (M4)')
-    axes[3].legend(loc='upper left', fontsize=12)
-
-    stable_changes = np.flatnonzero(stable[1:] != stable[:-1]) + 1
-    for i, idx in enumerate(stable_changes):
-        x = idx * WINDOW_STEP_SECONDS
-        axes[2].axvline(x, color='black', linestyle=':', alpha=0.5, linewidth=0.8)
-        axes[3].axvline(x, color='black', linestyle=':', alpha=0.4, linewidth=0.8)
-
-    axes[3].set_xlabel('Время, с', fontweight='bold', fontsize=24)
-    axes[3].set_ylabel('Переключения', fontweight='bold', fontsize=24)
-    axes[3].set_title('Накопленное число переключений', fontweight='bold', loc='left', fontsize=24)
-    axes[3].legend(loc='upper left', fontsize=12)
-    axes[3].grid(alpha=0.3)
-
-    fig.suptitle(f'Offline-демонстратор',
-                fontweight='bold', y=1.02, fontsize=30)
-
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIG_DIR / f'offline_demo_rec_{test_record_ids[num_slices]}.png',
-                dpi=160, bbox_inches='tight')
+    for values, label, color in ((raw, 'M3', '#888888'),
+                                  (stable, 'M4', '#d62728')):
+        axes[3].step(t, cumulative_switches(values), where='post',
+                     linewidth=2, color=color, label=label)
+    axes[3].set_xlim(0, duration)
+    axes[3].axvspan(lo, hi, color='black', alpha=0.07)
+    axes[3].set_title('Накопленное число переключений', loc='left', fontsize=23, fontweight='bold')
+    axes[3].set_xlabel('Время, с', fontsize=24, fontweight='bold')
+    axes[3].set_ylabel('Переключения', fontsize=24, fontweight='bold')
+    axes[3].tick_params(labelsize=16)
+    axes[3].legend(prop={'size': 20, 'weight': 'bold'}, loc='upper left')
+    for ax in axes + zoom_axes:
+        for tick in ax.get_xticklabels() + ax.get_yticklabels():
+            tick.set_fontweight('bold')
+    handles = [Patch(facecolor=colors[k], edgecolor='black', label=LABEL_NAMES[k])
+               for k in [1, 2, 3, 4, 0]]
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.955),
+               ncol=5, prop={'size': 24, 'weight': 'bold'}, handlelength=2, handleheight=1.4, frameon=True)
+    fig.suptitle('Offline-демонстратор',
+                 fontsize=28, fontweight='bold', y=0.995)
+    if fig_dir is not None:
+        Path(fig_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(fig_dir) / f'offline_demo_rec_{test_record_ids[num_slices]}.png',
+                    dpi=160, bbox_inches='tight')
+    return fig
 
 def main():
     from dataset import BvhDataset
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    from constants import LABEL_MAP
     parser = argparse.ArgumentParser()
+    parser.add_argument('--skip-preparation', action='store_true',
+                        help='Использовать готовые train/conf/test.csv без повторной обработки BVH')
     parser.add_argument(
         "--records",
         nargs="+",
-        default=["2_9", "2_10", "2_12", "2_14", "2_15", "2_16"],
+        default=list(RECORD_IDS),
+        help='Полные имена без расширения: первые 3 train, четвёртая conf, остальные test',
     )
     args = parser.parse_args()
+    if len(args.records) < 5 or len(set(args.records)) != len(args.records):
+        parser.error('--records требует минимум 5 разных записей: 3 train, 1 conf, остальные test')
 
     records_ids = tuple(args.records)
     train_record_ids = records_ids[:3]
     conf_record_ids = records_ids[3:4]
     test_record_ids = records_ids[4:]
-    BvhDataset(args.records)
+    if not args.skip_preparation:
+        BvhDataset(args.records, output_dir=DATA_DIR, label_map=LABEL_MAP)
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
 
     print(args.records)
 
@@ -596,11 +661,8 @@ def main():
     print('Окон по записям:', dict(zip(records_ids, [*train_sizes, *conf_sizes, *test_sizes])))
     display(pd.DataFrame({'split': ['train', 'conf', 'test'], 'windows': [len(y_train), len(y_conf), len(y_test)]}).assign(duration_min=lambda d: d.windows * WINDOW_STEP_SECONDS / 60))
 
-    #Кластеры сопоставляются с четырьмя размеченными состояниями команды венгерским алгоритмом на train. DISTRACTOR в обучение прототипов не входит.
-    #VQ без отдельного reject-класса обязан ошибочно активироваться вне словаря команд, и это учитывают метрики. (хороший вопрос именно так нужно считать либо нет)
-
-    mask = y_train != 0 # выкидываем DISTRACTOR из обучения
-    X_cmd, y_cmd = X_train[mask], y_train[mask]
+    # Сопоставляем прототипы со всеми пятью классами по train.
+    X_cmd, y_cmd = X_train, y_train
 
     # одноуровневый паплайн
 
@@ -622,9 +684,9 @@ def main():
     print('Двухуровневое сопоставление:', two_mapping, '; z->a:', z_to_a.tolist())
     print('Размеры поддействий:', sub_weights.astype(int).tolist())
 
-    # Настройка только на conf. Выбираем по строгому Event-F1@50, затем по
-    # минимуму ложных активаций/мин и 95%-й задержки.
-    # Соритируем по "лексеграфическому" порядку
+    # Настройка только на conf. Для M2 сохраняем максимум Event-F1@50.
+    # Режим M4 выбирается через M4_SELECTION_MODE в constants.py.
+    # f1 максимизирует F1, reliability использует сравнение с M1–M3.
 
     one_conf = predict_one_level(X_conf, one_mapping, one_vq)
     two_conf, two_confidence = predict_two_level(X_conf, sub_vq, z_to_a, two_mapping, with_confidence=True)
@@ -643,7 +705,18 @@ def main():
     def choose(df):
         return df.sort_values(['event_f1@50', 'false_activations_per_min', 'p95_delay_s', 'median_delay_s'], ascending=[False, True, True, True], na_position='last').iloc[0]
 
-    best_m2, best_m4 = choose(tuning.query("method == 'M2_one_level_majority'")), choose(tuning.query("method == 'M4_two_level_automaton'"))
+    best_m2 = choose(tuning.query("method == 'M2_one_level_majority'"))
+    baseline_f1 = max(
+        evaluate(y_conf, one_conf, conf_slices)["event_f1@50"],
+        best_m2["event_f1@50"],
+        evaluate(y_conf, two_conf, conf_slices)["event_f1@50"],
+    )
+    best_m4 = choose_m4_params(
+        tuning.query("method == 'M4_two_level_automaton'"), baseline_f1=baseline_f1,
+    )
+    print(f'Режим M4: {best_m4["selection_mode"]}. Conf: лучший M1–M3 = {baseline_f1:.6f}, '
+          f'лучший M4 = {best_m4["conf_best_m4_f1@50"]:.6f}, '
+          f'нижняя граница M4 = {best_m4["conf_min_m4_f1@50"]:.6f}')
     best_window = int(best_m2.window); best_confirmations, best_threshold = int(best_m4.confirmations), float(best_m4.threshold)
     tuning.to_csv(RESULTS_DIR / 'validation_tuning.csv', index=False)
     display(tuning.sort_values(['method','event_f1@50'], ascending=[True,False]))
@@ -651,7 +724,7 @@ def main():
     print(f'Зафиксированы параметры: M2 window={best_window}; M4 confirmations={best_confirmations}, threshold={best_threshold:.2f}')
 
     # постройка графика надёжность-задержка
-    build_plot_reliability_latency_m4(tuning)
+    plt.close(build_plot_reliability_latency_m4(tuning))
 
 
     ## Финальный расчёт на test
@@ -669,15 +742,16 @@ def main():
     display(comparison.round(3))
 
     # постройка графика предсказание-эталон
-    build_plot_prediction_reference(predictions, y_test)
+    plt.close(build_plot_prediction_reference(predictions, y_test))
 
     # постройка графика ложные активации мидеанная задержка
-    build_plot_reliability_latency_compare(comparison)
+    plt.close(build_plot_reliability_latency_compare(comparison))
 
     print(f'Размер test_slices {len(test_slices)}')
 
     for i in range(0, len(test_slices)):
         offline_demonstrator_and_automated_causality_test(test_slices, i, test_record_ids, two_test, two_test_confidence, best_confirmations, best_threshold, y_test, m4_test, m4_states)
+        plt.close('all')
 
 if __name__ == "__main__":
     main()

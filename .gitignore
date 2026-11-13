@@ -10,3 +10,5 @@ results
 __pycache__
 paper
 results_my
+catboost_info
+tests
